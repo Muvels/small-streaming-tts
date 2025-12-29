@@ -534,6 +534,10 @@ def main():
                        help="Override log directory from config")
     parser.add_argument("--gradient_accumulation", type=int, default=1,
                        help="Gradient accumulation steps (use to simulate larger batches)")
+    parser.add_argument("--stage1_epochs", type=int, default=None,
+                       help="Override number of epochs for stage 1 (main transformer)")
+    parser.add_argument("--stage2_epochs", type=int, default=None,
+                       help="Override number of epochs for stage 2 (joint training)")
     args = parser.parse_args()
     
     # Setup logging
@@ -580,6 +584,14 @@ def main():
     
     # Apply gradient accumulation
     config.training.gradient_accumulation = args.gradient_accumulation
+    
+    # Apply custom epoch counts
+    if args.stage1_epochs is not None:
+        config.training.stage1_epochs = args.stage1_epochs
+        logger.info(f"Stage 1 epochs override: {args.stage1_epochs}")
+    if args.stage2_epochs is not None:
+        config.training.stage2_epochs = args.stage2_epochs
+        logger.info(f"Stage 2 epochs override: {args.stage2_epochs}")
     
     if args.log_dir:
         config.log_dir = args.log_dir
