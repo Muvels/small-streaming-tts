@@ -273,11 +273,12 @@ class Trainer:
         
         pbar = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch + 1}")
         
-        for batch in pbar:
+        accumulation_steps = getattr(self.config.training, 'gradient_accumulation', 1)
+        accumulated_loss = 0.0
+        
+        for batch_idx, batch in enumerate(pbar):
             if batch is None:
                 continue
-                
-            optimizer.zero_grad()
             
             # Forward pass
             if stage == 1:
@@ -285,23 +286,35 @@ class Trainer:
             else:
                 metrics, loss = self.train_step_stage2(batch)
             
+            # Scale loss for gradient accumulation
+            loss = loss / accumulation_steps
+            accumulated_loss += loss.item()
+            
             # Backward pass
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.training.gradient_clip,
-                )
-                self.scaler.step(optimizer)
-                self.scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.training.gradient_clip,
-                )
-                optimizer.step()
+            
+            # Step optimizer every accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                if self.scaler is not None:
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.training.gradient_clip,
+                    )
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.training.gradient_clip,
+                    )
+                    optimizer.step()
+                
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_loss = 0.0
                 
             scheduler.step()
             
@@ -322,8 +335,18 @@ class Trainer:
                     optimizer.param_groups[0]["lr"],
                     self.global_step,
                 )
+            
+            # MPS memory cleanup (critical for Apple Silicon)
+            if self.device.type == "mps" and self.global_step % 10 == 0:
+                torch.mps.empty_cache()
                 
             self.global_step += 1
+        
+        # End of epoch cleanup for MPS
+        if self.device.type == "mps":
+            torch.mps.empty_cache()
+            import gc
+            gc.collect()
         
         # Average metrics
         if num_batches > 0:
@@ -504,11 +527,13 @@ def main():
                        choices=["auto", "cuda", "mps", "cpu"],
                        help="Device to train on")
     parser.add_argument("--batch_size", type=int, default=None,
-                       help="Override batch size from config")
-    parser.add_argument("--num_workers", type=int, default=4,
-                       help="Number of data loading workers")
+                       help="Override batch size (default: 32 for CUDA, 8 for MPS, 4 for CPU)")
+    parser.add_argument("--num_workers", type=int, default=None,
+                       help="Number of data loading workers (default: 4 for CUDA, 0 for MPS)")
     parser.add_argument("--log_dir", type=str, default=None,
                        help="Override log directory from config")
+    parser.add_argument("--gradient_accumulation", type=int, default=1,
+                       help="Gradient accumulation steps (use to simulate larger batches)")
     args = parser.parse_args()
     
     # Setup logging
@@ -520,23 +545,44 @@ def main():
     # Load config
     config = TTSConfig.from_yaml(args.config)
     
-    # Override config with command line args
-    if args.batch_size:
-        config.training.stage1_batch_size = args.batch_size
-        config.training.stage2_batch_size = args.batch_size
-    if args.log_dir:
-        config.log_dir = args.log_dir
-    
-    # Get device
+    # Get device first to set device-specific defaults
     device = get_device(args.device)
     logger.info(f"Using device: {device}")
     
-    # Print device info
-    if device.type == "cuda":
+    # Device-specific defaults
+    if device.type == "mps":
+        # MPS has memory limitations - use smaller batches
+        default_batch_size = 8
+        default_num_workers = 0  # Multiprocessing can cause issues on MPS
+        logger.info("Apple Silicon detected - using MPS-optimized settings:")
+        logger.info("  - Reduced batch size (8) to manage unified memory")
+        logger.info("  - Disabled data workers (0) for stability")
+        logger.info("  - Disabled mixed precision (not well supported)")
+    elif device.type == "cuda":
+        default_batch_size = 32
+        default_num_workers = 4
         logger.info(f"CUDA device: {torch.cuda.get_device_name()}")
         logger.info(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    elif device.type == "mps":
-        logger.info("Using Apple Silicon MPS backend")
+    else:
+        default_batch_size = 4
+        default_num_workers = 0
+        logger.info("Using CPU - training will be slow")
+    
+    # Apply batch size (command line > config > device default)
+    batch_size = args.batch_size or config.training.stage1_batch_size
+    if device.type == "mps" and batch_size > 16:
+        logger.warning(f"Batch size {batch_size} may cause memory issues on MPS. Consider --batch_size 8")
+    config.training.stage1_batch_size = args.batch_size or default_batch_size
+    config.training.stage2_batch_size = args.batch_size or default_batch_size
+    
+    # Apply num_workers
+    num_workers = args.num_workers if args.num_workers is not None else default_num_workers
+    
+    # Apply gradient accumulation
+    config.training.gradient_accumulation = args.gradient_accumulation
+    
+    if args.log_dir:
+        config.log_dir = args.log_dir
     
     # Create tokenizer
     tokenizer = TextTokenizer(vocab_size=config.text_vocab_size)
@@ -551,18 +597,20 @@ def main():
     logger.info(f"  Total: {param_count['total']:,}")
     
     # Create dataloaders
-    # Don't pin memory for MPS
     pin_memory = device.type == "cuda"
     
     train_dataloader, val_dataloader = create_train_val_dataloaders(
         data_dir=args.data_dir,
         tokenizer=tokenizer,
         batch_size=config.training.stage1_batch_size,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         num_codebooks=config.num_codebooks,
         pin_memory=pin_memory,
     )
     
+    logger.info(f"Batch size: {config.training.stage1_batch_size}")
+    logger.info(f"Gradient accumulation: {config.training.gradient_accumulation}")
+    logger.info(f"Effective batch size: {config.training.stage1_batch_size * config.training.gradient_accumulation}")
     logger.info(f"Train batches: {len(train_dataloader)}")
     if val_dataloader:
         logger.info(f"Val batches: {len(val_dataloader)}")
