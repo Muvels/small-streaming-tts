@@ -1,0 +1,81 @@
+# Small Streaming TTS Configuration
+
+# Model Architecture
+model:
+  # Main Temporal Transformer (~65M params)
+  main:
+    hidden_dim: 768      # 768 / 12 = 64 dim per head
+    num_layers: 12
+    num_heads: 12        # Must be divisible by num_kv_heads
+    num_kv_heads: 4      # GQA: 3 query heads per KV head
+    ffn_dim: 2048        # ~2.6x hidden for SwiGLU
+    dropout: 0.1
+    max_seq_len: 8192
+
+  # Depth Transformer (~15M params)
+  depth:
+    hidden_dim: 512
+    num_layers: 4
+    num_heads: 8         # 512 / 8 = 64 dim per head
+    ffn_dim: 1024
+    dropout: 0.1
+
+  # Embeddings
+  text_vocab_size: 4096
+  audio_vocab_size: 2048  # Per codebook
+  num_codebooks: 4
+  speaker_embed_dim: 256
+  num_speakers: 2
+  num_languages: 2
+
+# Mimi Codec
+codec:
+  sample_rate: 24000
+  frame_rate: 12.5  # Hz
+  num_codebooks: 4
+  bandwidth: 1.1  # kbps
+
+# Training
+training:
+  # Stage 1: Main transformer only
+  stage1:
+    epochs: 100
+    batch_size: 32
+    learning_rate: 1.0e-4
+    warmup_steps: 1000
+    weight_decay: 0.01
+    gradient_clip: 1.0
+
+  # Stage 2: Joint training with depth
+  stage2:
+    epochs: 50
+    batch_size: 24
+    learning_rate: 5.0e-5
+    warmup_steps: 500
+
+  # Common
+  seed: 42
+  num_workers: 4
+  mixed_precision: true
+  gradient_accumulation: 1
+
+# Data
+data:
+  train_path: "data/train"
+  val_path: "data/val"
+  max_audio_len: 30.0  # seconds
+  min_audio_len: 0.5
+
+# Inference
+inference:
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.9
+
+# Logging
+logging:
+  log_dir: "logs"
+  save_every: 1000
+  eval_every: 500
+  log_every: 100
+
