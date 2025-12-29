@@ -161,10 +161,13 @@ class SwiGLU(nn.Module):
 
 
 class GroupedQueryAttention(nn.Module):
-    """Grouped Query Attention (GQA).
+    """Grouped Query Attention (GQA) with Flash Attention support.
     
     Reduces KV cache by sharing key/value heads across query heads.
     With 12 query heads and 4 KV heads: 3x memory reduction.
+    
+    Uses PyTorch's scaled_dot_product_attention for memory-efficient
+    Flash Attention when available (reduces memory from O(n²) to O(n)).
     """
     
     def __init__(
@@ -182,14 +185,13 @@ class GroupedQueryAttention(nn.Module):
         self.num_groups = num_heads // num_kv_heads
         self.head_dim = head_dim or (dim // num_heads)
         self.scale = self.head_dim ** -0.5
+        self.dropout_p = dropout
         
         # Projections
         self.q_proj = nn.Linear(dim, num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(num_heads * self.head_dim, dim, bias=False)
-        
-        self.dropout = nn.Dropout(dropout)
         
         # RoPE
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len)
@@ -241,26 +243,28 @@ class GroupedQueryAttention(nn.Module):
             k = k.repeat_interleave(self.num_groups, dim=1)
             v = v.repeat_interleave(self.num_groups, dim=1)
         
-        # Compute attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # Use Flash Attention via scaled_dot_product_attention
+        # This reduces memory from O(n²) to O(n) and is much faster
+        dropout_p = self.dropout_p if self.training else 0.0
         
-        # Apply causal mask if no mask provided
         if mask is None:
-            # Causal mask for autoregressive generation
-            kv_len = k.shape[2]
-            causal_mask = torch.triu(
-                torch.full((seq_len, kv_len), float("-inf"), device=x.device),
-                diagonal=kv_len - seq_len + 1
+            # Use built-in causal mask (more efficient)
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=True,
             )
-            attn_weights = attn_weights + causal_mask
         else:
-            attn_weights = attn_weights + mask
-            
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        output = torch.matmul(attn_weights, v)
+            # Custom mask provided - convert additive mask to boolean if needed
+            # scaled_dot_product_attention expects True = attend, False = mask out
+            # or additive mask where -inf = mask out
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
         
         # Reshape and project output
         output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)

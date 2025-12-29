@@ -93,8 +93,8 @@ class Trainer:
         # Mixed precision - only for CUDA
         self.use_amp = supports_amp(self.device) and config.training.mixed_precision
         if self.use_amp:
-            from torch.cuda.amp import GradScaler
-            self.scaler = GradScaler()
+            from torch.amp import GradScaler
+            self.scaler = GradScaler('cuda')
         else:
             self.scaler = None
             
@@ -185,8 +185,8 @@ class Trainer:
         
         # Forward through main transformer
         if self.use_amp:
-            from torch.cuda.amp import autocast
-            with autocast():
+            from torch.amp import autocast
+            with autocast('cuda'):
                 logits, hidden, _ = self.model.main_transformer(
                     text_tokens=text_tokens,
                     audio_tokens=cb1_input,
@@ -237,8 +237,8 @@ class Trainer:
         language_id = batch["language_id"].to(self.device)
         
         if self.use_amp:
-            from torch.cuda.amp import autocast
-            with autocast():
+            from torch.amp import autocast
+            with autocast('cuda'):
                 cb1_loss, depth_loss, total_loss = self.model(
                     text_tokens=text_tokens,
                     audio_tokens=audio_tokens,
