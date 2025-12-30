@@ -4,6 +4,8 @@ This module provides a wrapper around Kyutai's Mimi codec with:
 - 4 codebook configuration (reduced from 8 for easier learning)
 - Streaming encode/decode support
 - Efficient token handling
+
+Uses Hugging Face Transformers implementation of Mimi.
 """
 
 import torch
@@ -22,6 +24,8 @@ class MimiCodecWrapper(nn.Module):
     
     The first codebook (CB1) captures semantic information (distilled from WavLM),
     while CB2-4 capture acoustic details progressively.
+    
+    Uses Hugging Face Transformers implementation.
     """
 
     def __init__(
@@ -41,36 +45,75 @@ class MimiCodecWrapper(nn.Module):
         self.vocab_size = 2048
         
         self._mimi = None
+        self._feature_extractor = None
         self._initialized = False
 
-    def _lazy_init(self):
-        """Lazy initialization of Mimi codec."""
+    def _lazy_init(self, input_device: str = None):
+        """Lazy initialization of Mimi codec from Hugging Face.
+        
+        Args:
+            input_device: Device of input tensor (used to determine where to run codec)
+        """
         if self._initialized:
             return
+        
+        # Determine the device to use
+        # If input_device is provided and different from init device, update
+        if input_device is not None:
+            self.device = input_device
             
         try:
-            from moshi.models import loaders
+            from transformers import MimiModel, AutoFeatureExtractor
             
-            # Load Mimi codec
-            self._mimi = loaders.get_mimi(
-                device=self.device,
-                dtype=torch.float32,
-            )
-            self._mimi.set_num_codebooks(self.num_codebooks)
+            print("Loading Mimi codec from Hugging Face (kyutai/mimi)...")
+            
+            # Mimi works best on CPU; MPS has compatibility issues
+            codec_device = "cpu"  # Always use CPU for Mimi for compatibility
+            
+            # Load the pre-trained Mimi model
+            self._mimi = MimiModel.from_pretrained("kyutai/mimi")
+            self._mimi = self._mimi.to(codec_device)
+            self._mimi.eval()
+            self._codec_device = codec_device
+            
+            # Note: num_quantizers is the total (32), we only USE first num_codebooks
+            # Don't change the config, just use first N codebooks
+            
+            # Load the feature extractor
+            self._feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+            
             self._initialized = True
-            logger.info(f"Mimi codec initialized with {self.num_codebooks} codebooks")
+            print(f"Mimi codec loaded! Using {self.num_codebooks} codebooks, decoder on {codec_device}")
             
         except ImportError as e:
-            logger.warning(f"Mimi codec not available: {e}")
-            logger.warning("Using mock codec for development")
+            print(f"WARNING: Hugging Face Transformers Mimi not available: {e}")
+            print("Using mock codec - output will be random noise!")
             self._mimi = None
+            self._codec_device = "cpu"
+            self._initialized = True
+        except Exception as e:
+            print(f"WARNING: Failed to load Mimi codec: {e}")
+            print("Using mock codec - output will be random noise!")
+            self._mimi = None
+            self._codec_device = "cpu"
             self._initialized = True
 
+    def _get_mimi(self, input_device: str = None):
+        """Get the Mimi codec, initializing if needed."""
+        self._lazy_init(input_device)
+        return self._mimi
+    
     @property
     def mimi(self):
-        """Get the Mimi codec, initializing if needed."""
+        """Get the Mimi codec (property for backward compatibility)."""
         self._lazy_init()
         return self._mimi
+    
+    @property
+    def feature_extractor(self):
+        """Get the feature extractor, initializing if needed."""
+        self._lazy_init()
+        return self._feature_extractor
 
     def encode(self, audio: torch.Tensor) -> torch.Tensor:
         """Encode audio to codec tokens.
@@ -81,14 +124,30 @@ class MimiCodecWrapper(nn.Module):
         Returns:
             tokens: Codec tokens [batch, num_codebooks, num_frames]
         """
+        original_device = audio.device
+        
+        # Ensure [batch, channels, samples] format
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)  # Add channel dim
+        
+        # Initialize with input device context
+        mimi = self._get_mimi(str(original_device))
             
-        if self.mimi is not None:
+        if mimi is not None:
             with torch.no_grad():
-                tokens = self.mimi.encode(audio)
-            # Take only first num_codebooks
-            tokens = tokens[:, :self.num_codebooks, :]
+                # Move to codec device (CPU for Mimi compatibility)
+                audio = audio.to(self._codec_device)
+                
+                # Create padding mask (all ones = no padding)
+                padding_mask = torch.ones(audio.shape[0], audio.shape[2], dtype=torch.long, device=self._codec_device)
+                
+                # Encode using HuggingFace Mimi
+                # IMPORTANT: request exactly num_codebooks quantizers so encode+decode is consistent.
+                encoder_outputs = mimi.encode(audio, padding_mask=padding_mask, num_quantizers=self.num_codebooks)
+                tokens = encoder_outputs.audio_codes  # [batch, num_codebooks, num_frames]
+                
+                # Move back to original device
+                tokens = tokens.to(original_device)
         else:
             # Mock encoding for development
             batch_size = audio.shape[0]
@@ -96,7 +155,7 @@ class MimiCodecWrapper(nn.Module):
             tokens = torch.randint(
                 0, self.vocab_size,
                 (batch_size, self.num_codebooks, num_frames),
-                device=audio.device
+                device=original_device
             )
             
         return tokens
@@ -110,26 +169,38 @@ class MimiCodecWrapper(nn.Module):
         Returns:
             audio: Audio waveform [batch, 1, samples]
         """
-        if self.mimi is not None:
-            # Pad to 8 codebooks if Mimi requires it
-            if tokens.shape[1] < 8:
-                padding = torch.zeros(
-                    tokens.shape[0],
-                    8 - tokens.shape[1],
-                    tokens.shape[2],
-                    dtype=tokens.dtype,
-                    device=tokens.device
-                )
-                tokens = torch.cat([tokens, padding], dim=1)
-                
+        original_device = tokens.device
+        
+        # Initialize with input device context
+        mimi = self._get_mimi(str(original_device))
+        
+        if mimi is not None:
             with torch.no_grad():
-                audio = self.mimi.decode(tokens)
+                # Move to codec device (CPU for Mimi compatibility)
+                tokens = tokens.to(self._codec_device).long()
+
+                # IMPORTANT:
+                # - Do NOT pad to 32 quantizers. If the codes were produced with 4 codebooks,
+                #   padding the remaining 28 with zeros can yield garbage/noise.
+                # - Use MimiModel.decode(), which correctly reconstructs waveform for the
+                #   provided number of quantizers.
+                decoder_out = mimi.decode(audio_codes=tokens)
+
+                # transformers returns MimiDecoderOutput with .audio_values
+                audio = decoder_out.audio_values if hasattr(decoder_out, "audio_values") else decoder_out[0]
+
+                # Ensure output is [batch, 1, samples]
+                if audio.dim() == 2:
+                    audio = audio.unsqueeze(1)
+
+                # Move back to original device
+                audio = audio.to(original_device)
         else:
             # Mock decoding for development
             batch_size = tokens.shape[0]
             num_frames = tokens.shape[-1]
             num_samples = num_frames * self.frame_size
-            audio = torch.randn(batch_size, 1, num_samples, device=tokens.device)
+            audio = torch.randn(batch_size, 1, num_samples, device=original_device)
             
         return audio
 

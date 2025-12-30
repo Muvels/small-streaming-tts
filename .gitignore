@@ -163,3 +163,6 @@ checkpoints/
 *.pt
 *.pth
 *.ckpt
+
+*.wav
+debug_out/

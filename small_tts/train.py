@@ -185,6 +185,12 @@ class Trainer:
         """
         text_tokens = batch["text_tokens"].to(self.device)
         audio_tokens = batch["audio_tokens"].to(self.device)
+        text_lengths = batch.get("text_lengths", None)
+        audio_lengths = batch.get("audio_lengths", None)
+        if text_lengths is not None:
+            text_lengths = text_lengths.to(self.device)
+        if audio_lengths is not None:
+            audio_lengths = audio_lengths.to(self.device)
         speaker_id = batch["speaker_id"].to(self.device)
         language_id = batch["language_id"].to(self.device)
         
@@ -204,34 +210,60 @@ class Trainer:
                     audio_tokens=cb1_input,
                     speaker_id=speaker_id,
                     language_id=language_id,
+                    text_lengths=text_lengths,
+                    audio_lengths=audio_lengths,
                 )
                 
                 # Get logits for audio positions only
                 audio_start = 1 + text_tokens.shape[1]  # Skip cond + text
                 audio_logits = logits[:, audio_start:audio_start + cb1_target.shape[1], :]
                 
-                # Compute loss
-                loss = F.cross_entropy(
-                    audio_logits.reshape(-1, self.config.audio_vocab_size),
-                    cb1_target.reshape(-1),
-                    reduction="mean",
-                )
+                # Compute masked loss (pad token == 0 is a VALID Mimi code; use lengths)
+                if audio_lengths is not None:
+                    valid_lens = (audio_lengths - 1).clamp(min=0, max=cb1_target.shape[1])
+                    tpos = torch.arange(cb1_target.shape[1], device=self.device)[None, :]
+                    mask = tpos < valid_lens[:, None]
+                    per_tok = F.cross_entropy(
+                        audio_logits.transpose(1, 2),  # [B,V,T-1]
+                        cb1_target,
+                        reduction="none",
+                    )
+                    loss = per_tok[mask].mean() if mask.any() else per_tok.mean()
+                else:
+                    loss = F.cross_entropy(
+                        audio_logits.reshape(-1, self.config.audio_vocab_size),
+                        cb1_target.reshape(-1),
+                        reduction="mean",
+                    )
         else:
             logits, hidden, _ = self.model.main_transformer(
                 text_tokens=text_tokens,
                 audio_tokens=cb1_input,
                 speaker_id=speaker_id,
                 language_id=language_id,
+                text_lengths=text_lengths,
+                audio_lengths=audio_lengths,
             )
             
             audio_start = 1 + text_tokens.shape[1]
             audio_logits = logits[:, audio_start:audio_start + cb1_target.shape[1], :]
             
-            loss = F.cross_entropy(
-                audio_logits.reshape(-1, self.config.audio_vocab_size),
-                cb1_target.reshape(-1),
-                reduction="mean",
-            )
+            if audio_lengths is not None:
+                valid_lens = (audio_lengths - 1).clamp(min=0, max=cb1_target.shape[1])
+                tpos = torch.arange(cb1_target.shape[1], device=self.device)[None, :]
+                mask = tpos < valid_lens[:, None]
+                per_tok = F.cross_entropy(
+                    audio_logits.transpose(1, 2),
+                    cb1_target,
+                    reduction="none",
+                )
+                loss = per_tok[mask].mean() if mask.any() else per_tok.mean()
+            else:
+                loss = F.cross_entropy(
+                    audio_logits.reshape(-1, self.config.audio_vocab_size),
+                    cb1_target.reshape(-1),
+                    reduction="mean",
+                )
         
         return {"loss": loss.item(), "cb1_loss": loss.item()}, loss
     
@@ -245,6 +277,12 @@ class Trainer:
         """
         text_tokens = batch["text_tokens"].to(self.device)
         audio_tokens = batch["audio_tokens"].to(self.device)
+        text_lengths = batch.get("text_lengths", None)
+        audio_lengths = batch.get("audio_lengths", None)
+        if text_lengths is not None:
+            text_lengths = text_lengths.to(self.device)
+        if audio_lengths is not None:
+            audio_lengths = audio_lengths.to(self.device)
         speaker_id = batch["speaker_id"].to(self.device)
         language_id = batch["language_id"].to(self.device)
         
@@ -256,6 +294,8 @@ class Trainer:
                     audio_tokens=audio_tokens,
                     speaker_id=speaker_id,
                     language_id=language_id,
+                    text_lengths=text_lengths,
+                    audio_lengths=audio_lengths,
                 )
         else:
             cb1_loss, depth_loss, total_loss = self.model(
@@ -263,6 +303,8 @@ class Trainer:
                 audio_tokens=audio_tokens,
                 speaker_id=speaker_id,
                 language_id=language_id,
+                text_lengths=text_lengths,
+                audio_lengths=audio_lengths,
             )
         
         return {

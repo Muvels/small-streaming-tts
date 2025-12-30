@@ -89,6 +89,8 @@ class StreamingTTS(nn.Module):
         audio_tokens: torch.Tensor,
         speaker_id: Optional[torch.Tensor] = None,
         language_id: Optional[torch.Tensor] = None,
+        text_lengths: Optional[torch.Tensor] = None,
+        audio_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass for training.
         
@@ -119,6 +121,8 @@ class StreamingTTS(nn.Module):
             audio_tokens=cb1_input,
             speaker_id=speaker_id,
             language_id=language_id,
+            text_lengths=text_lengths,
+            audio_lengths=audio_lengths,
         )
         
         # Get hidden states corresponding to audio positions
@@ -128,19 +132,51 @@ class StreamingTTS(nn.Module):
         
         # CB1 loss
         cb1_logits_flat = cb1_logits[:, audio_start:audio_start + cb1_target.shape[1], :]
-        cb1_loss = F.cross_entropy(
-            cb1_logits_flat.reshape(-1, self.config.audio_vocab_size),
-            cb1_target.reshape(-1),
-            reduction="mean"
-        )
+        # Mask loss on padded positions using audio_lengths (pad token == 0 is a VALID Mimi code,
+        # so we cannot rely on ignore_index).
+        if audio_lengths is not None:
+            valid_lens = (audio_lengths.to(cb1_target.device) - 1).clamp(min=0, max=cb1_target.shape[1])
+            tpos = torch.arange(cb1_target.shape[1], device=cb1_target.device)[None, :]
+            mask = tpos < valid_lens[:, None]  # [B, T-1]
+            per_tok = F.cross_entropy(
+                cb1_logits_flat.transpose(1, 2),  # [B, V, T-1]
+                cb1_target,
+                reduction="none",
+            )  # [B, T-1]
+            cb1_loss = per_tok[mask].mean() if mask.any() else per_tok.mean()
+        else:
+            cb1_loss = F.cross_entropy(
+                cb1_logits_flat.reshape(-1, self.config.audio_vocab_size),
+                cb1_target.reshape(-1),
+                reduction="mean"
+            )
         
         # Depth transformer: predict CB2-4
         cb234_target = cb234_tokens[:, 1:, :]  # Align with CB1 targets
-        _, depth_loss = self.depth_transformer(
+        depth_logits, _ = self.depth_transformer(
             cb1_tokens=cb1_target,  # Use ground truth CB1 for teacher forcing
             main_hidden=audio_hidden,
-            target_tokens=cb234_target,
+            target_tokens=None,
         )
+
+        if audio_lengths is not None:
+            # depth_logits: [B, T-1, 3, V], cb234_target: [B, T-1, 3]
+            valid_lens = (audio_lengths.to(cb234_target.device) - 1).clamp(min=0, max=cb234_target.shape[1])
+            tpos = torch.arange(cb234_target.shape[1], device=cb234_target.device)[None, :]
+            mask_t = tpos < valid_lens[:, None]  # [B, T-1]
+            per = F.cross_entropy(
+                depth_logits.reshape(-1, self.config.audio_vocab_size),
+                cb234_target.reshape(-1),
+                reduction="none",
+            ).view(cb234_target.shape[0], cb234_target.shape[1], cb234_target.shape[2])  # [B,T-1,3]
+            mask = mask_t.unsqueeze(-1).expand_as(per)
+            depth_loss = per[mask].mean() if mask.any() else per.mean()
+        else:
+            _, depth_loss = self.depth_transformer(
+                cb1_tokens=cb1_target,
+                main_hidden=audio_hidden,
+                target_tokens=cb234_target,
+            )
         
         # Combined loss
         total_loss = cb1_loss + depth_loss
@@ -398,14 +434,15 @@ class StreamingTTSInference:
         self.model.eval()
         self.device = device
         
-        # Simple character-level tokenizer for now
-        # TODO: Replace with proper tokenizer
-        self.char_to_id = {chr(i): i for i in range(256)}
-        self.id_to_char = {i: chr(i) for i in range(256)}
+        # IMPORTANT: Use the SAME tokenizer as training (see `small_tts.data.TextTokenizer`).
+        # The model is trained on those IDs (including BOS/EOS), so using a different mapping
+        # at inference time will produce garbage/gibberish output.
+        from small_tts.data import TextTokenizer
+        self.tokenizer = TextTokenizer(vocab_size=self.model.config.text_vocab_size)
         
     def tokenize(self, text: str) -> torch.Tensor:
         """Convert text to tokens."""
-        tokens = [self.char_to_id.get(c, 0) for c in text]
+        tokens = self.tokenizer.encode(text, add_special=True)
         return torch.tensor([tokens], dtype=torch.long, device=self.device)
     
     @torch.no_grad()

@@ -247,24 +247,16 @@ class GroupedQueryAttention(nn.Module):
         # This reduces memory from O(n²) to O(n) and is much faster
         dropout_p = self.dropout_p if self.training else 0.0
         
-        if mask is None:
-            # Use built-in causal mask (more efficient)
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=dropout_p,
-                is_causal=True,
-            )
-        else:
-            # Custom mask provided - convert additive mask to boolean if needed
-            # scaled_dot_product_attention expects True = attend, False = mask out
-            # or additive mask where -inf = mask out
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=mask,
-                dropout_p=dropout_p,
-                is_causal=False,
-            )
+        # IMPORTANT:
+        # - We always want CAUSAL attention for this model.
+        # - If a mask is provided (e.g. key padding mask), it should be treated as an
+        #   *additional* constraint on top of causality, not a replacement.
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=dropout_p,
+            is_causal=True,
+        )
         
         # Reshape and project output
         output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)

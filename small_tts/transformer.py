@@ -179,6 +179,8 @@ class MainTransformer(nn.Module):
         audio_tokens: Optional[torch.Tensor] = None,
         speaker_id: Optional[torch.Tensor] = None,
         language_id: Optional[torch.Tensor] = None,
+        text_lengths: Optional[torch.Tensor] = None,
+        audio_lengths: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCache]]:
         """Forward pass for training or inference.
@@ -220,6 +222,36 @@ class MainTransformer(nn.Module):
             x = torch.cat([cond, text_emb, audio_emb], dim=1)
         else:
             x = torch.cat([cond, text_emb], dim=1)
+
+        # Optional key padding mask (training-time only).
+        # This prevents attention to padded TEXT/AUDIO tokens, which otherwise makes the model
+        # learn batch-padding artifacts and hurts conditioning quality.
+        attn_mask = None
+        if kv_cache is None and (text_lengths is not None or audio_lengths is not None):
+            bsz = x.shape[0]
+            cond_len = 1
+            text_len = text_tokens.shape[1]
+            audio_len = audio_tokens.shape[1] if audio_tokens is not None else 0
+            total_len = cond_len + text_len + audio_len
+
+            key_valid = torch.ones(bsz, total_len, dtype=torch.bool, device=x.device)
+
+            if text_lengths is not None:
+                tl = text_lengths.to(device=x.device).clamp(min=0, max=text_len)
+                tpos = torch.arange(text_len, device=x.device)[None, :]
+                text_valid = tpos < tl[:, None]
+                key_valid[:, cond_len:cond_len + text_len] = text_valid
+
+            if audio_tokens is not None and audio_lengths is not None:
+                # audio_tokens here are the *input* CB1 tokens (shifted), so valid input length is (audio_lengths - 1)
+                al = (audio_lengths.to(device=x.device) - 1).clamp(min=0, max=audio_len)
+                apos = torch.arange(audio_len, device=x.device)[None, :]
+                audio_valid = apos < al[:, None]
+                key_valid[:, cond_len + text_len:cond_len + text_len + audio_len] = audio_valid
+
+            # SDPA boolean mask: True = attend allowed, False = masked out.
+            # Shape chosen to broadcast across heads and query length.
+            attn_mask = key_valid[:, None, None, :]  # [B, 1, 1, S]
             
         # Determine start position for RoPE
         start_pos = 0
@@ -232,7 +264,7 @@ class MainTransformer(nn.Module):
         # Forward through layers
         for i, layer in enumerate(self.layers):
             layer_cache = new_cache.get(i)
-            x, (k, v) = layer(x, kv_cache=layer_cache, start_pos=start_pos)
+            x, (k, v) = layer(x, mask=attn_mask, kv_cache=layer_cache, start_pos=start_pos)
             new_cache.update(i, k, v)
             
         new_cache.seq_len = start_pos + x.shape[1]
