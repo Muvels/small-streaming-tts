@@ -78,12 +78,14 @@ class Trainer:
         train_dataloader,
         val_dataloader=None,
         device: torch.device = None,
+        freeze_main_transformer: bool = False,
     ):
         self.config = config
         self.device = device or get_device()
         self.model = model.to(self.device)
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.freeze_main_transformer = freeze_main_transformer
         
         # Training state
         self.stage = 1
@@ -112,6 +114,8 @@ class Trainer:
         
         logger.info(f"Trainer initialized on device: {self.device}")
         logger.info(f"Mixed precision: {self.use_amp}")
+        if freeze_main_transformer:
+            logger.info("Main transformer will be FROZEN in Stage 2")
         
     def create_optimizer(self, stage: int) -> AdamW:
         """Create optimizer for current stage."""
@@ -121,8 +125,16 @@ class Trainer:
             params = self.model.main_transformer.parameters()
         else:
             lr = self.config.training.stage2_lr
-            # Train both transformers
-            params = self.model.parameters()
+            
+            if self.freeze_main_transformer:
+                # Freeze main transformer - only train depth transformer
+                logger.info("Freezing main transformer parameters")
+                for param in self.model.main_transformer.parameters():
+                    param.requires_grad = False
+                params = self.model.depth_transformer.parameters()
+            else:
+                # Train both transformers
+                params = self.model.parameters()
             
         return AdamW(
             params,
@@ -404,16 +416,30 @@ class Trainer:
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
     
-    def load_checkpoint(self, path: str):
-        """Load training checkpoint."""
+    def load_checkpoint(self, path: str, weights_only: bool = False):
+        """Load training checkpoint.
+        
+        Args:
+            path: Path to checkpoint file
+            weights_only: If True, only load model weights (ignore training state).
+                         Useful for starting Stage 2 from a Stage 1 checkpoint.
+        """
         checkpoint = torch.load(path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.stage = checkpoint.get("stage", 1)
-        self.epoch = checkpoint.get("epoch", 0)
-        self.global_step = checkpoint.get("global_step", 0)
         
-        logger.info(f"Loaded checkpoint from {path}")
+        if not weights_only:
+            self.stage = checkpoint.get("stage", 1)
+            self.epoch = checkpoint.get("epoch", 0)
+            self.global_step = checkpoint.get("global_step", 0)
+            logger.info(f"Loaded checkpoint from {path} (full state)")
+        else:
+            logger.info(f"Loaded checkpoint from {path} (weights only)")
+            
+        # Log checkpoint info
+        ckpt_stage = checkpoint.get("stage", "unknown")
+        ckpt_epoch = checkpoint.get("epoch", "unknown")
+        logger.info(f"  Checkpoint was from: Stage {ckpt_stage}, Epoch {ckpt_epoch}")
     
     def train_stage1(self):
         """Stage 1: Train main transformer for CB1 prediction."""
@@ -496,15 +522,27 @@ class Trainer:
         self.save_checkpoint("final")
         logger.info("Stage 2 training complete!")
     
-    def train(self):
-        """Run full two-stage training."""
+    def train(self, start_stage: int = 1):
+        """Run two-stage training.
+        
+        Args:
+            start_stage: Which stage to start from (1 or 2).
+                        Use start_stage=2 to skip Stage 1 (e.g., when loading
+                        a Stage 1 checkpoint and only training Stage 2).
+        """
         start_time = time.time()
         
-        # Stage 1
-        self.train_stage1()
-        
-        # Stage 2
-        self.train_stage2()
+        if start_stage == 1:
+            # Stage 1
+            self.train_stage1()
+            # Stage 2
+            self.train_stage2()
+        elif start_stage == 2:
+            logger.info("Skipping Stage 1, starting directly at Stage 2")
+            # Stage 2 only
+            self.train_stage2()
+        else:
+            raise ValueError(f"start_stage must be 1 or 2, got {start_stage}")
         
         elapsed = time.time() - start_time
         logger.info(f"Training complete in {elapsed / 3600:.2f} hours")
@@ -521,8 +559,14 @@ def main():
                        help="Path to config YAML file")
     parser.add_argument("--data_dir", type=str, required=True,
                        help="Path to prepared dataset (with train.jsonl, val.jsonl, tokens/)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="Path to checkpoint file to load model weights from")
     parser.add_argument("--resume", type=str, default=None,
-                       help="Path to checkpoint to resume from")
+                       help="Path to checkpoint to resume training from (loads full state)")
+    parser.add_argument("--start_stage", type=int, default=1, choices=[1, 2],
+                       help="Which stage to start training from (default: 1)")
+    parser.add_argument("--freeze_main_transformer", action="store_true",
+                       help="Freeze main transformer in Stage 2 (only train depth transformer)")
     parser.add_argument("--device", type=str, default="auto",
                        choices=["auto", "cuda", "mps", "cpu"],
                        help="Device to train on")
@@ -634,14 +678,32 @@ def main():
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         device=device,
+        freeze_main_transformer=args.freeze_main_transformer,
     )
     
-    # Resume if specified
+    # Handle checkpoint loading
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        # Resume training - load full state (model + training progress)
+        trainer.load_checkpoint(args.resume, weights_only=False)
+        logger.info("Resuming training from checkpoint")
+    elif args.checkpoint:
+        # Load model weights only (for starting stage 2 from stage 1 checkpoint)
+        trainer.load_checkpoint(args.checkpoint, weights_only=True)
+        logger.info("Loaded model weights from checkpoint")
+    
+    # Validate start_stage with checkpoint
+    if args.start_stage == 2 and not (args.checkpoint or args.resume):
+        logger.warning("Starting at Stage 2 without a checkpoint - main transformer is untrained!")
+    
+    # Log training configuration
+    logger.info(f"Starting at Stage: {args.start_stage}")
+    if args.freeze_main_transformer:
+        logger.info("Main transformer: FROZEN in Stage 2")
+    else:
+        logger.info("Main transformer: TRAINABLE in Stage 2")
     
     # Train
-    trainer.train()
+    trainer.train(start_stage=args.start_stage)
 
 
 if __name__ == "__main__":
