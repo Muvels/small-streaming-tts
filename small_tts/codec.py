@@ -64,6 +64,14 @@ class MimiCodecWrapper(nn.Module):
             
         try:
             from transformers import MimiModel, AutoFeatureExtractor
+
+            # Suppress very noisy NNPACK warnings on some CPU environments.
+            # (NNPACK is an optional CPU acceleration backend; failing to init is not fatal.)
+            try:
+                import torch.backends.nnpack as nnpack  # type: ignore
+                nnpack.set_flags(_enabled=False)
+            except Exception:
+                pass
             
             print("Loading Mimi codec from Hugging Face (kyutai/mimi)...")
             
