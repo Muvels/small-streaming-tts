@@ -44,6 +44,16 @@ class TrainingConfig:
     stage1_batch_size: int = 32
     stage1_lr: float = 1e-4
     stage1_warmup_steps: int = 1000
+    # Overfitting guard (Stage 1)
+    # If validation loss increases vs the previous epoch for `stage1_overfit_patience`
+    # consecutive epochs (after `stage1_overfit_min_epochs`), we stop Stage 1 early.
+    # The training loop will then proceed to Stage 2 (if start_stage==1).
+    stage1_overfit_patience: int = 1
+    stage1_overfit_min_epochs: int = 5
+    stage1_overfit_delta: float = 0.0  # required increase to count as "worse"
+    stage1_switch_to_stage2_on_overfit: bool = True
+    # Stage 2 init
+    stage2_init_from_best_stage1: bool = True
 
     # Stage 2
     stage2_epochs: int = 50
@@ -58,6 +68,13 @@ class TrainingConfig:
     num_workers: int = 4
     mixed_precision: bool = True
     gradient_accumulation: int = 1
+    # Checkpointing
+    # If True, save a checkpoint at the end of every epoch with a unique name
+    # (e.g. stage1_epoch005.pt). This can use a lot of disk for large models.
+    save_every_epoch: bool = False
+    # Optional pruning: keep only the last N epoch checkpoints per stage.
+    # 0 means keep all.
+    keep_last_n_epoch_checkpoints: int = 20
 
 
 @dataclass
@@ -125,8 +142,18 @@ class TTSConfig:
             if "stage2" in training:
                 for k, v in training["stage2"].items():
                     setattr(config.training, f"stage2_{k}", v)
-            for key in ["seed", "num_workers", "mixed_precision", "gradient_accumulation",
-                       "weight_decay", "gradient_clip"]:
+            for key in [
+                "seed",
+                "num_workers",
+                "mixed_precision",
+                "gradient_accumulation",
+                "weight_decay",
+                "gradient_clip",
+                # checkpointing / stage control
+                "save_every_epoch",
+                "keep_last_n_epoch_checkpoints",
+                "stage2_init_from_best_stage1",
+            ]:
                 if key in training:
                     setattr(config.training, key, training[key])
 

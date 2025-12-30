@@ -26,6 +26,7 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Optional, Dict, Any
 import time
+import re
 
 from small_tts.config import TTSConfig
 from small_tts.model import StreamingTTS
@@ -457,6 +458,32 @@ class Trainer:
         path = self.checkpoint_dir / f"{name}.pt"
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
+
+    def _prune_epoch_checkpoints(self, stage: int):
+        """Optionally prune epoch checkpoints to keep only the last N per stage."""
+        keep_n = int(getattr(self.config.training, "keep_last_n_epoch_checkpoints", 0) or 0)
+        if keep_n <= 0:
+            return
+
+        # Match: stage{stage}_epochXYZ.pt
+        pattern = re.compile(rf"^stage{stage}_epoch(\d+)\.pt$")
+        matches = []
+        for p in self.checkpoint_dir.glob(f"stage{stage}_epoch*.pt"):
+            m = pattern.match(p.name)
+            if m:
+                matches.append((int(m.group(1)), p))
+
+        matches.sort(key=lambda x: x[0])  # oldest first
+        if len(matches) <= keep_n:
+            return
+
+        to_delete = matches[: max(0, len(matches) - keep_n)]
+        for _, p in to_delete:
+            try:
+                p.unlink()
+                logger.info(f"Pruned old epoch checkpoint: {p}")
+            except Exception as e:
+                logger.warning(f"Failed to delete old epoch checkpoint {p}: {e}")
     
     def load_checkpoint(self, path: str, weights_only: bool = False):
         """Load training checkpoint.
@@ -499,6 +526,12 @@ class Trainer:
         scheduler = self.create_scheduler(optimizer, stage=1, num_training_steps=num_training_steps)
         
         best_val_loss = float("inf")
+        prev_val_loss = None
+        overfit_count = 0
+        overfit_patience = getattr(self.config.training, "stage1_overfit_patience", 0) or 0
+        overfit_min_epochs = getattr(self.config.training, "stage1_overfit_min_epochs", 0) or 0
+        overfit_delta = float(getattr(self.config.training, "stage1_overfit_delta", 0.0) or 0.0)
+        switch_to_stage2 = bool(getattr(self.config.training, "stage1_switch_to_stage2_on_overfit", True))
         
         for epoch in range(num_epochs):
             self.epoch = epoch
@@ -511,18 +544,55 @@ class Trainer:
             val_metrics = self.validate(stage=1)
             if val_metrics:
                 logger.info(f"Epoch {epoch + 1}/{num_epochs} - Val: {val_metrics}")
+                val_loss = float(val_metrics.get("loss", float("inf")))
                 
                 # Save best model
-                if val_metrics.get("loss", float("inf")) < best_val_loss:
-                    best_val_loss = val_metrics["loss"]
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
                     self.save_checkpoint("best_stage1")
+
+                # Overfitting guard: stop Stage 1 if val loss rises vs previous epoch.
+                if overfit_patience > 0:
+                    if prev_val_loss is not None and (val_loss > prev_val_loss + overfit_delta):
+                        overfit_count += 1
+                        logger.info(
+                            f"Stage1 overfit guard: val loss increased "
+                            f"({prev_val_loss:.4f} -> {val_loss:.4f}), "
+                            f"count={overfit_count}/{overfit_patience}"
+                        )
+                    else:
+                        overfit_count = 0
+                    prev_val_loss = val_loss
+
+                    if (epoch + 1) >= overfit_min_epochs and overfit_count >= overfit_patience:
+                        logger.warning(
+                            "Stage1 overfit guard triggered: stopping Stage 1 early "
+                            f"at epoch {epoch + 1}. "
+                            + ("Will proceed to Stage 2." if switch_to_stage2 else "Training will stop after Stage 1.")
+                        )
+                        # Restore best stage1 weights before exiting Stage 1
+                        best_path = self.checkpoint_dir / "best_stage1.pt"
+                        if best_path.exists():
+                            self.load_checkpoint(str(best_path), weights_only=True)
+                            logger.info(f"Restored best Stage1 weights from {best_path}")
+                        break
+
+            # Save every epoch (unique name, never overwritten)
+            if bool(getattr(self.config.training, "save_every_epoch", False)):
+                self.save_checkpoint(f"stage1_epoch{epoch + 1:03d}")
+                self._prune_epoch_checkpoints(stage=1)
                     
-            # Save periodic checkpoint
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f"stage1_epoch{epoch + 1}")
+            # Save periodic checkpoint (only if not saving every epoch)
+            if not bool(getattr(self.config.training, "save_every_epoch", False)):
+                if (epoch + 1) % 10 == 0:
+                    self.save_checkpoint(f"stage1_epoch{epoch + 1}")
                 
         self.save_checkpoint("stage1_final")
         logger.info("Stage 1 training complete!")
+        if not switch_to_stage2 and overfit_patience > 0 and overfit_count >= overfit_patience:
+            logger.warning("Stage1 overfit guard requested to STOP training after Stage 1.")
+            # Mark stage to prevent stage2 if caller uses `train(start_stage=1)`
+            self._stop_after_stage1 = True
     
     def train_stage2(self):
         """Stage 2: Joint training with depth transformer."""
@@ -556,10 +626,16 @@ class Trainer:
                 if val_metrics.get("loss", float("inf")) < best_val_loss:
                     best_val_loss = val_metrics["loss"]
                     self.save_checkpoint("best_stage2")
+
+            # Save every epoch (unique name, never overwritten)
+            if bool(getattr(self.config.training, "save_every_epoch", False)):
+                self.save_checkpoint(f"stage2_epoch{epoch + 1:03d}")
+                self._prune_epoch_checkpoints(stage=2)
                     
             # Save periodic checkpoint
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f"stage2_epoch{epoch + 1}")
+            if not bool(getattr(self.config.training, "save_every_epoch", False)):
+                if (epoch + 1) % 10 == 0:
+                    self.save_checkpoint(f"stage2_epoch{epoch + 1}")
                 
         self.save_checkpoint("final")
         logger.info("Stage 2 training complete!")
@@ -577,6 +653,16 @@ class Trainer:
         if start_stage == 1:
             # Stage 1
             self.train_stage1()
+            if getattr(self, "_stop_after_stage1", False):
+                logger.warning("Stopping after Stage 1 due to overfit guard configuration.")
+                self.writer.close()
+                return
+            # Always start Stage 2 from best Stage 1 weights (if present/configured)
+            if bool(getattr(self.config.training, "stage2_init_from_best_stage1", True)):
+                best_path = self.checkpoint_dir / "best_stage1.pt"
+                if best_path.exists():
+                    self.load_checkpoint(str(best_path), weights_only=True)
+                    logger.info(f"Stage2 init: loaded best Stage1 weights from {best_path}")
             # Stage 2
             self.train_stage2()
         elif start_stage == 2:

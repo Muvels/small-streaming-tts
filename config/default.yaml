@@ -45,6 +45,12 @@ training:
     warmup_steps: 1000
     weight_decay: 0.01
     gradient_clip: 1.0
+    # Overfitting guard: if val loss increases vs previous epoch, stop Stage 1 early
+    # and continue with Stage 2 (still starting Stage 2 from best Stage 1 weights).
+    overfit_patience: 1
+    overfit_min_epochs: 5
+    overfit_delta: 0.0
+    switch_to_stage2_on_overfit: true
 
   # Stage 2: Joint training with depth
   stage2:
@@ -58,6 +64,10 @@ training:
   num_workers: 4
   mixed_precision: true
   gradient_accumulation: 1
+  stage2_init_from_best_stage1: true
+  # Checkpointing
+  save_every_epoch: true
+  keep_last_n_epoch_checkpoints: 20
 
 # Data
 data:
